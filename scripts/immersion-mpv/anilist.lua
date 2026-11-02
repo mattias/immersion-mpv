@@ -3,6 +3,7 @@
 
 local utils = require "mp.utils"
 local http = require "http"
+local store = require "store"
 
 local M = {}
 
@@ -22,6 +23,7 @@ local function post(url, token, query, variables, done)
         url = url,
         headers = headers,
         body = utils.format_json({query = query, variables = variables}),
+        service = "anilist",
     }, function(status, text)
         if not status then
             done(nil, "no answer from AniList")
@@ -31,6 +33,8 @@ local function post(url, token, query, variables, done)
         if status ~= 200 or not reply or not reply.data then
             if status == 401 or status == 400 and text:find("Invalid token", 1, true) then
                 done(nil, "AniList refused the token")
+            elseif status == http.LIMITED then
+                done(nil, "AniList's rate limit was hit; trying again later")
             else
                 done(nil, "AniList answered " .. status)
             end
@@ -40,19 +44,40 @@ local function post(url, token, query, variables, done)
     end)
 end
 
+-- Series data barely changes: searches and series are kept a month, a search
+-- that found nothing a day. Your list is never cached.
+local SERIES_DAYS = 30
+local NOTHING_DAYS = 1
+
 function M.search(url, text, done)
+    local key = "anilist-search:" .. text:lower()
+    local hit = store.cache_get(key)
+    if hit then
+        done(hit)
+        return
+    end
     post(url, nil, SEARCH, {search = text}, function(data, err)
         if not data then
             done(nil, err)
             return
         end
-        done(data.Page and data.Page.media or {})
+        local found = data.Page and data.Page.media or {}
+        store.cache_put(key, found, #found > 0 and SERIES_DAYS or NOTHING_DAYS)
+        done(found)
     end)
 end
 
 function M.by_id(url, id, done)
+    local key = "anilist-media:" .. tostring(id)
+    local hit = store.cache_get(key)
+    if hit then
+        done(hit)
+        return
+    end
     post(url, nil, BY_ID, {id = id}, function(data, err)
-        done(data and data.Media or nil, err)
+        local media = data and type(data.Media) == "table" and data.Media or nil
+        if media then store.cache_put(key, media, SERIES_DAYS) end
+        done(media, err)
     end)
 end
 

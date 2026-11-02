@@ -132,7 +132,10 @@ At the threshold it reads your list and:
 ## Statistics
 
 Rows are appended to `stats.jsonl` in the data folder every 30 seconds and when
-a file ends:
+a file ends. When a file ends (and when mpv starts), the file is **compacted**:
+all rows of one file on one day become a single row with the sums, so a year
+of watching stays a few hundred rows. A file still playing keeps getting new
+rows, which the next compaction folds in.
 
 ```json
 {"v":1,"date":"2026-11-01","ended":1793569915,"file":"[SubsPlease] Sousou no Frieren - 03 (1080p).mkv","title":"Sousou no Frieren","anilist_id":154587,"episode":3,"seconds":312.4,"lines":58,"chars":701}
@@ -150,8 +153,16 @@ a file ends:
 | `lines`, `chars` | New lines and their characters, without white space |
 
 **Rows are increments: sum them.** The total per file and day is the sum of
-all rows with the same `date` and `file`; weeks, months and years follow from
-`date`. Group on `file`, not `title`, which can change within a file's rows.
+all rows with the same `date` and `file` (usually one, after compaction);
+weeks, months and years follow from `date`. Group on `file`, not `title`,
+which can change within a file's rows.
+
+Compaction never loses or doubles a row, even with several mpv windows
+writing or mpv stopping halfway: one compaction runs at a time (a lock
+folder, `stats.lock`), `stats.jsonl` is first renamed so new rows start a new
+file, and a run that got as far as writing down what it merged is finished by
+the next one rather than redone. For a moment during a compaction
+`stats.jsonl` may be missing; a reader that finds no file can try again.
 
 ```python
 from collections import defaultdict
@@ -178,9 +189,30 @@ What counts:
 - Only lines with Japanese count (*Count Japanese lines only*), so English
   subtitles add time but no lines.
 
+## Requests, cache and rate limits
+
+AniList and Jimaku limit how often they may be asked, so the plugin asks as
+little as it can, and keeps the answers in `cache.json`:
+
+| Question | Kept |
+| --- | --- |
+| AniList search, and a series by ID | 30 days; a search that found nothing, 1 day |
+| Jimaku: a series' entries | 7 days; none yet, 6 hours |
+| Jimaku: an episode's files | 1 day; nothing for the episode yet, 6 hours |
+| Jimaku: the subtitle itself | for good, in `subs/` |
+| A series chosen for a folder | for good, in `choices.json` |
+
+Your AniList list is never cached: it is read right before progress is set.
+Errors are never cached.
+
+When a service answers *429 Too Many Requests*, or says no requests are left,
+the plugin leaves it alone for as long as it asks (`Retry-After` or
+`x-ratelimit-reset-after`, at least a minute), in every mpv, and says so.
+
 ## Data folder
 
 `%APPDATA%\immersion-mpv` / `~/.config/immersion-mpv`: `stats.jsonl`,
+`cache.json` and `blocked.json` (see above),
 `choices.json` (remembered series), `coverage.json` (how much of each file has
 played), `seen-<date>.tsv` (today's lines), `secrets.json`, `subs/` (Jimaku:
 `ep003.srt` as downloaded, `ep003-<video>.srt` timed to one video,

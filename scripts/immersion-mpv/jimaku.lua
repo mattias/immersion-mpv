@@ -117,7 +117,8 @@ local function download(file, media_id, episode, done)
         done(nil, "cannot create the subtitle folder")
         return
     end
-    http.request({url = file.url, output = target .. ".part", follow = true, max_size = MAX_SIZE, timeout = 30},
+    http.request({url = file.url, output = target .. ".part", follow = true, max_size = MAX_SIZE, timeout = 30,
+        service = "jimaku"},
         function(status)
             if status ~= 200 then
                 os.remove(target .. ".part")
@@ -133,15 +134,18 @@ end
 -- done(path, reason): the saved subtitle, or nil and why there is none.
 function M.fetch(base_url, key, media_id, episode, group, done)
     local headers = {"Authorization: " .. key}
-    local function get(path, callback)
-        http.get_json({url = base_url .. path, headers = headers}, callback)
+    local function get(path, cache, callback)
+        http.get_json({url = base_url .. path, headers = headers, service = "jimaku", cache = cache}, callback)
     end
     local function failed(status)
         if status == 401 then return "Jimaku refused the key" end
-        if status == 429 then return "Jimaku's rate limit was hit" end
+        if status == http.LIMITED then return "Jimaku's rate limit was hit; trying again later" end
         return "Jimaku answered " .. tostring(status)
     end
-    get("/api/entries/search?anilist_id=" .. http.escape(media_id), function(entries, status)
+    -- Which entries a series has rarely changes; an episode's files do while
+    -- it airs, and "nothing yet" is asked again after a few hours.
+    local entries_cache = {key = "jimaku-entries:" .. tostring(media_id), days = 7, empty_days = 0.25}
+    get("/api/entries/search?anilist_id=" .. http.escape(media_id), entries_cache, function(entries, status)
         if not entries then
             done(nil, failed(status))
             return
@@ -156,13 +160,17 @@ function M.fetch(base_url, key, media_id, episode, group, done)
             end
             local path = "/api/entries/" .. http.escape(entry.id) .. "/files"
             if episode then path = path .. "?episode=" .. episode end
-            get(path, function(files, file_status)
+            local files_cache = {key = "jimaku-files:" .. tostring(entry.id) .. ":" .. tostring(episode or "movie"),
+                days = 1, empty_days = 0.25}
+            get(path, files_cache, function(files, file_status)
                 if not files then
                     done(nil, failed(file_status))
                     return
                 end
                 local file = M.pick_file(files, episode, group)
                 if not file then
+                    -- A list without this episode counts as nothing yet.
+                    store.cache_put(files_cache.key, {}, files_cache.empty_days)
                     next_entry()
                     return
                 end

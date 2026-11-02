@@ -277,5 +277,58 @@ do
     same(tracker.lines, 2, "the same words much later are a new line")
 end
 
+-- Compaction, in a folder of its own.
+local store = require "store"
+local utils = require "mp.utils"
+store.use_dir(utils.join_path(os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp", "immersion-unit-" .. mp.get_property("pid", "0")))
+store.ensure_dir(store.dir)
+local function rows()
+    local list = {}
+    for line in (store.read(store.path("stats.jsonl")) or ""):gmatch("[^\n]+") do table.insert(list, (utils.parse_json(line))) end
+    return list
+end
+local function row(date, file, seconds, lines, extra)
+    local value = {v = 1, date = date, file = file, seconds = seconds, lines = lines, chars = lines * 3, ended = 100}
+    for key, item in pairs(extra or {}) do value[key] = item end
+    return utils.format_json(value) .. "\n"
+end
+store.write(store.path("stats.jsonl"), row("2026-11-01", "a.mkv", 30, 2) .. row("2026-11-01", "b.mkv", 10, 1)
+    .. row("2026-11-01", "a.mkv", 29.95, 3, {title = "A", anilist_id = 5, ended = 200}) .. row("2026-11-02", "a.mkv", 5, 1)
+    .. "not json\n")
+same(store.compact_stats(), true, "compaction runs")
+local list = rows()
+same(#list, 3, "one row per file and day")
+same(store.read(store.path("stats.jsonl")):find("not json", 1, true) ~= nil, true, "a line that is not a row is kept")
+same(list[1].file .. list[1].seconds .. "/" .. list[1].lines .. "/" .. list[1].chars, "a.mkv60/5/15", "sums")
+same(list[1].title .. list[1].anilist_id .. "/" .. list[1].ended, "A5/200", "the latest title, id and end")
+same(list[3].date, "2026-11-02", "another day stays its own row")
+store.compact_stats()
+same(#rows(), 3, "compacting again changes nothing")
+
+-- A run stopped after its commit is finished by the next, not counted twice.
+store.write(store.path("stats.raw-old"), row("2026-11-03", "c.mkv", 7, 1))
+store.write(store.path("stats.tmp-old"), store.read(store.path("stats.jsonl")) .. row("2026-11-03", "c.mkv", 7, 1))
+store.write(store.path("stats.commit-old"), utils.format_json({"stats.raw-old"}))
+os.remove(store.path("stats.jsonl"))
+store.compact_stats()
+local c = 0
+for _, item in ipairs(rows()) do if item.file == "c.mkv" then c = c + item.seconds end end
+same(c, 7, "a committed run is finished once")
+-- A run stopped before its commit is done again from its raw file.
+store.write(store.path("stats.raw-stopped"), row("2026-11-04", "d.mkv", 4, 1))
+store.write(store.path("stats.tmp-stopped"), "half")
+store.compact_stats()
+local d = 0
+for _, item in ipairs(rows()) do if item.file == "d.mkv" then d = d + item.seconds end end
+same(d, 4, "an uncommitted run is redone from its raw rows")
+local leftovers = 0
+for _, name in ipairs(utils.readdir(store.dir, "files") or {}) do
+    if name ~= "stats.jsonl" then leftovers = leftovers + 1 end
+end
+same(leftovers, 0, "nothing is left behind")
+same(utils.file_info(store.path("stats.lock")), nil, "the lock is released")
+for _, name in ipairs(utils.readdir(store.dir, "files") or {}) do os.remove(store.path(name)) end
+mp.command_native({name = "subprocess", args = {"cmd", "/d", "/c", "rmdir", (store.dir:gsub("/", "\\"))}, playback_only = false})
+
 print(("%d checks, %d failed"):format(checks, failures))
 mp.commandv("quit", failures == 0 and 0 or 1)

@@ -25,15 +25,40 @@ local function quoted(value)
         :gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t") .. '"'
 end
 
+-- A service that said "too many requests" (or that none are left) is not
+-- asked again until it said to come back: one block per service, shared by
+-- every mpv through the data folder.
+local MIN_WAIT = 60
+
+local function blocked_until(service)
+    local blocks = store.read_json(store.path("blocked.json")) or {}
+    return tonumber(blocks[service]) or 0
+end
+
+local function block(service, seconds)
+    local path = store.path("blocked.json")
+    local blocks = store.read_json(path) or {}
+    blocks[service] = os.time() + math.max(MIN_WAIT, math.ceil(seconds or 0))
+    store.write_json(path, blocks)
+    msg.warn(service .. " asked to wait; no requests to it for " .. (blocks[service] - os.time()) .. " s")
+end
+
+M.LIMITED = 429
+
 -- request: url, headers (list of "Name: value"), body, output (a file to save
--- to), follow (redirects), timeout, max_size.
+-- to), follow (redirects), timeout, max_size, service (a name for rate limits).
 -- done(status, text): status is nil when no answer came, and text then says why.
+-- A blocked service answers 429 without being asked.
 function M.request(request, done)
+    if request.service and blocked_until(request.service) > os.time() then
+        done(M.LIMITED, "")
+        return
+    end
     local config = {
         "url = " .. quoted(request.url),
         "user-agent = " .. quoted(USER_AGENT),
         "max-time = " .. tostring(request.timeout or 20),
-        "write-out = " .. quoted("\n%{http_code}"),
+        "write-out = " .. quoted("\n%{http_code}\n%header{retry-after}|%header{x-ratelimit-remaining}|%header{x-ratelimit-reset-after}"),
     }
     for _, header in ipairs(request.headers or {}) do
         table.insert(config, "header = " .. quoted(header))
@@ -63,18 +88,40 @@ function M.request(request, done)
             done(nil, reason)
             return
         end
-        local body, status = result.stdout:match("^(.*)\n(%d+)$")
-        done(tonumber(status), body or "")
+        -- With the body in a file, curl on Windows writes these lines in text
+        -- mode, with CR LF; the body itself is left as it came.
+        local stdout = request.output and result.stdout:gsub("\r", "") or result.stdout
+        local body, status, retry, remaining, reset = stdout:match("^(.*)\n(%d+)\n([^|\n]*)|([^|\n]*)|([^|\n]*)$")
+        status = tonumber(status)
+        if request.service and (status == M.LIMITED or remaining == "0") then
+            block(request.service, tonumber(retry) or tonumber(reset))
+        end
+        done(status, body or "")
     end)
 end
 
+-- request.cache: {key, days, empty_days}. A good answer is kept for days, an
+-- empty list (nothing there yet) for empty_days; errors are never kept.
 function M.get_json(request, done)
+    local cache = request.cache
+    if cache then
+        local hit = store.cache_get(cache.key)
+        if hit ~= nil then
+            done(hit, 200)
+            return
+        end
+    end
     M.request(request, function(status, text)
         if status ~= 200 then
             done(nil, status, text)
             return
         end
-        done(utils.parse_json(text), status)
+        local value = utils.parse_json(text)
+        if cache and value ~= nil then
+            local empty = type(value) == "table" and next(value) == nil
+            store.cache_put(cache.key, value, empty and (cache.empty_days or cache.days) or cache.days)
+        end
+        done(value, status)
     end)
 end
 

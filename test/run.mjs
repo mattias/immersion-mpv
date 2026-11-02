@@ -78,6 +78,11 @@ const server = http.createServer((request, response) => {
     if (url.pathname === "/api/entries/77/files" && url.searchParams.get("episode") === "8") {
       return json([{ name: "[Z] Testshow Alpha - 08.srt", url: `http://127.0.0.1:${server.address().port}/dl/eight.srt`, size: 10, last_modified: "2025-01-01T00:00:00Z" }]);
     }
+    if (url.pathname === "/api/entries/77/files" && url.searchParams.get("episode") === "10") return json([]);
+    if (url.pathname === "/api/entries/77/files" && url.searchParams.get("episode") === "11") {
+      response.writeHead(429, { "Content-Type": "application/json", "Retry-After": "120" });
+      return response.end("{}");
+    }
     if (url.pathname === "/dl/eight.srt") {
       response.writeHead(200);
       return response.end(subtitleAt(2.5, n => `日本語の行${n + 1}です`));
@@ -244,6 +249,36 @@ try {
   const nine = video("Series/[Z] Testshow Alpha - 09 (1080p).mkv", 20, null, { text: subtitleAt(0, n => `字幕の行${n + 1}`), lang: "und" });
   result = await run(nine, "both", { data: timing, extra: ["--script-opts-append=e2e-wait=5"] });
   check(!requests.some(entry => entry.query === "?episode=9"), "an untagged Japanese track is recognised: no Jimaku", JSON.stringify(result.seen));
+
+  console.log("-- cache and rate limits");
+  const cached = dataDir("cached", true);
+  const ten = video("Series/[Z] Testshow Alpha - 10 (1080p).mkv", 6);
+  const jimakuCalls = () => requests.filter(entry => entry.path.startsWith("/api/")).length;
+  before = searches();
+  let calls = jimakuCalls();
+  await run(ten, "both", { data: cached, extra: ["--script-opts-append=e2e-wait=3"] });
+  check(jimakuCalls() === calls + 2 && searches() === before + 1, "the first time: one search, one series, one episode", `${jimakuCalls() - calls} ${searches() - before}`);
+  calls = jimakuCalls();
+  before = searches();
+  await run(ten, "both", { data: cached, extra: ["--script-opts-append=e2e-wait=3"] });
+  check(jimakuCalls() === calls, "an episode Jimaku has nothing for yet is not asked about again at once", `${jimakuCalls() - calls}`);
+  await run(video("Series/[Z] Testshow Alpha - 12 (1080p).mkv", 6), "both", { data: cached, extra: ["--script-opts-append=e2e-wait=3"] });
+  check(searches() === before, "the series is not searched again");
+  check(requests.filter(entry => entry.path === "/api/entries/search").length > 0 && jimakuCalls() === calls + 1, "nor looked up on Jimaku again: only the new episode", `${jimakuCalls() - calls}`);
+
+  calls = jimakuCalls();
+  await run(video("Series/[Z] Testshow Alpha - 11 (1080p).mkv", 6), "both", { data: cached, extra: ["--script-opts-append=e2e-wait=3"] });
+  check(jimakuCalls() === calls + 1, "a 429 is taken", `${jimakuCalls() - calls}`);
+  const blocks = JSON.parse(fs.readFileSync(path.join(cached, "blocked.json"), "utf8"));
+  check(blocks.jimaku - Date.now() / 1000 > 100, "and Jimaku is left alone for as long as it asked", JSON.stringify(blocks));
+  calls = jimakuCalls();
+  await run(video("Series/[Z] Testshow Alpha - 05 (1080p).mkv", 6), "both", { data: cached, extra: ["--script-opts-append=e2e-wait=3"] });
+  check(jimakuCalls() === calls, "no Jimaku request while it is blocked", `${jimakuCalls() - calls}`);
+
+  console.log("-- compaction");
+  const statRows = rows(statsData);
+  check(statRows.length === new Set(statRows.map(row => `${row.date}|${row.file}`)).size, "stats.jsonl holds one row per file and day", JSON.stringify(statRows));
+  check(sum(statRows, "lines") === 4, "with the same totals");
 
   console.log("-- two sittings");
   const split = dataDir("split", true);

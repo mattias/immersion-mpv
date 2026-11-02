@@ -27,6 +27,11 @@ end
 
 M.dir = data_dir()
 
+-- For tests.
+function M.use_dir(path)
+    M.dir = path
+end
+
 function M.path(...)
     local path = M.dir
     for _, part in ipairs({...}) do path = utils.join_path(path, part) end
@@ -87,6 +92,158 @@ function M.write_json(path, value)
     return false
 end
 
+-- Compaction: stats.jsonl's rows are increments, so all rows of one file on
+-- one day can become a single row with the sums, at any time, without
+-- changing any total. Other mpvs may be appending meanwhile, and nothing may
+-- be lost or counted twice, even if mpv stops halfway:
+--
+--   1. stats.jsonl is renamed to stats.raw-<run>; new rows start a new one.
+--   2. Every stats.raw-* (with any a stopped run left) is merged into
+--      stats.tmp-<run>.
+--   3. stats.commit-<run> names the raw files merged. From here the run is
+--      finished by whoever finds it, never redone.
+--   4. stats.tmp-<run> becomes stats.jsonl; a stats.jsonl that appeared
+--      meanwhile is set aside as one more raw file first.
+--   5. The raw files and the commit are removed.
+
+local function merge_rows(text)
+    local order, rows, other = {}, {}, {}
+    for line in text:gmatch("[^\r\n]+") do
+        local row = utils.parse_json(line)
+        if type(row) == "table" and row.date and row.file then
+            local key = tostring(row.date) .. "\0" .. tostring(row.file)
+            local sum = rows[key]
+            if not sum then
+                rows[key] = row
+                table.insert(order, key)
+            else
+                for _, field in ipairs({"seconds", "lines", "chars"}) do
+                    sum[field] = (tonumber(sum[field]) or 0) + (tonumber(row[field]) or 0)
+                end
+                sum.ended = math.max(tonumber(sum.ended) or 0, tonumber(row.ended) or 0)
+                sum.title = row.title or sum.title
+                sum.anilist_id = row.anilist_id or sum.anilist_id
+                sum.episode = row.episode or sum.episode
+            end
+        elseif line:find("%S") then
+            table.insert(other, line)
+        end
+    end
+    local out = {}
+    for _, key in ipairs(order) do
+        local row = rows[key]
+        row.seconds = math.floor((tonumber(row.seconds) or 0) * 10 + 0.5) / 10
+        table.insert(out, utils.format_json(row))
+    end
+    for _, line in ipairs(other) do table.insert(out, line) end
+    return #out > 0 and table.concat(out, "\n") .. "\n" or ""
+end
+
+M.merge_rows = merge_rows
+
+local run_count = 0
+
+local function finish_run(run)
+    local live = M.path("stats.jsonl")
+    local commit = M.read_json(M.path("stats.commit-" .. run))
+    if type(commit) ~= "table" then return end
+    local tmp = M.path("stats.tmp-" .. run)
+    if utils.file_info(tmp) then
+        for _ = 1, 20 do
+            if utils.file_info(live) then
+                run_count = run_count + 1
+                os.rename(live, M.path(("stats.raw-%s-late%d"):format(run, run_count)))
+            end
+            if os.rename(tmp, live) then break end
+        end
+        if utils.file_info(tmp) then return end
+    end
+    for _, name in ipairs(commit) do os.remove(M.path(name)) end
+    os.remove(M.path("stats.commit-" .. run))
+end
+
+-- One compaction at a time across every mpv: creating a folder either
+-- succeeds or finds it there. A lock left by a stopped mpv expires.
+local LOCK_STALE = 600
+
+local function shell(args)
+    local result = mp.command_native({name = "subprocess", args = args, playback_only = false,
+        capture_stdout = true, capture_stderr = true})
+    return result and result.status == 0
+end
+
+local function lock()
+    local path = M.path("stats.lock")
+    local native = is_windows and path:gsub("/", "\\") or path
+    local make = is_windows and {"cmd", "/d", "/c", "mkdir", native} or {"mkdir", native}
+    if shell(make) then return true end
+    local info = utils.file_info(path)
+    if info and os.time() - info.mtime > LOCK_STALE then
+        shell(is_windows and {"cmd", "/d", "/c", "rmdir", native} or {"rmdir", native})
+        return shell(make)
+    end
+    return false
+end
+
+local function unlock()
+    local native = is_windows and M.path("stats.lock"):gsub("/", "\\") or M.path("stats.lock")
+    shell(is_windows and {"cmd", "/d", "/c", "rmdir", native} or {"rmdir", native})
+end
+
+local compact_once
+
+function M.compact_stats()
+    if not lock() then return false end
+    local ok, result = pcall(compact_once)
+    -- Rows that arrived while it ran are merged too, once.
+    if ok and result then
+        for _, name in ipairs(utils.readdir(M.dir, "files") or {}) do
+            if name:find("^stats%.raw%-") then
+                pcall(compact_once)
+                break
+            end
+        end
+    end
+    unlock()
+    if not ok then msg.warn("compacting stats.jsonl: " .. tostring(result)) end
+    return ok and result
+end
+
+compact_once = function()
+    -- A run that got as far as its commit is finished, not redone.
+    for _, name in ipairs(utils.readdir(M.dir, "files") or {}) do
+        local run = name:match("^stats%.commit%-(.+)$")
+        if run and not run:find("%.tmp$") then finish_run(run) end
+    end
+    for _, name in ipairs(utils.readdir(M.dir, "files") or {}) do
+        local run = name:match("^stats%.tmp%-(.+)$")
+        if run and not utils.file_info(M.path("stats.commit-" .. run)) then os.remove(M.path(name)) end
+    end
+
+    run_count = run_count + 1
+    local run = ("%s-%d-%d"):format(mp.get_property("pid", "0"), os.time(), run_count)
+    local live = M.path("stats.jsonl")
+    if utils.file_info(live) and not os.rename(live, M.path("stats.raw-" .. run)) then return false end
+    local raw, parts = {}, {}
+    for _, name in ipairs(utils.readdir(M.dir, "files") or {}) do
+        if name:find("^stats%.raw%-") then
+            local text = M.read(M.path(name))
+            if text then
+                table.insert(raw, name)
+                table.insert(parts, text)
+            end
+        end
+    end
+    if #raw == 0 then return true end
+    if not M.write(M.path("stats.tmp-" .. run), merge_rows(table.concat(parts, "\n"))) then return false end
+    if not M.write_json(M.path("stats.commit-" .. run), raw) then
+        os.remove(M.path("stats.tmp-" .. run))
+        return false
+    end
+    finish_run(run)
+    return true
+end
+
 local function seen_path(date)
     return M.path("seen-" .. date .. ".tsv")
 end
@@ -133,6 +290,27 @@ function M.forget_coverage(file_id)
     if all[file_id] == nil then return end
     all[file_id] = nil
     M.write_json(path, next(all) and all or {})
+end
+
+-- Answers from AniList and Jimaku, so the same question is not asked again
+-- while the answer is fresh: {key = {until = time, value = ...}}. Stale
+-- entries are dropped whenever the cache is written.
+function M.cache_get(key)
+    local cache = M.read_json(M.path("cache.json")) or {}
+    local entry = cache[key]
+    if type(entry) ~= "table" or (tonumber(entry["until"]) or 0) <= os.time() then return nil end
+    return entry.value
+end
+
+function M.cache_put(key, value, days)
+    local path = M.path("cache.json")
+    local cache = M.read_json(path) or {}
+    local now = os.time()
+    for old, entry in pairs(cache) do
+        if type(entry) ~= "table" or (tonumber(entry["until"]) or 0) <= now then cache[old] = nil end
+    end
+    cache[key] = {["until"] = now + math.floor(days * 86400), value = value}
+    M.write_json(path, cache)
 end
 
 -- Keys never go in mpv's options, which verbose logs print.
