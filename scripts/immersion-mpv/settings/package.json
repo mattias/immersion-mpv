@@ -1,0 +1,16 @@
+{
+  "name": "immersion-mpv-settings",
+  "productName": "immersion-mpv",
+  "version": "0.1.0",
+  "description": "Settings window for immersion-mpv",
+  "license": "GPL-3.0-or-later",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "electron": "43.8.3",
+    "extract-zip": "2.0.1"
+  }
+}
