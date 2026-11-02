@@ -13,6 +13,8 @@ const DEFAULTS = {
   stats_enabled: true,
   stats_japanese_only: true,
   jimaku_enabled: true,
+  sync_enabled: true,
+  sync_whisper: true,
   anilist_enabled: true,
   anilist_threshold: 85,
   anilist_dry_run: true,

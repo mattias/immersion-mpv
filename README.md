@@ -9,7 +9,7 @@ turned off.
 - **Statistics**: per file and day, the time really played, unique subtitle
   lines and their characters. Written as JSON lines for your own scripts.
 - **Jimaku**: finds the right episode by AniList ID and episode number, saves
-  it locally and adds it with `sub-add`.
+  it locally, adds it with `sub-add`, and times it to your video.
 - **AniList**: recognises the series and episode from the file name and
   folder, and sets your progress once 85 % has really played.
 
@@ -87,6 +87,37 @@ alone. Network streams only count statistics.
 Absolute numbering is not converted: episode 28 of a second season numbered
 from 1 is refused, not moved onto the right season.
 
+### Jimaku subtitles
+
+A file counts as having Japanese subtitles when a track says so (language,
+title or file name), or, for a text track that says nothing, when its first
+five minutes read with ffmpeg are Japanese. Many raws carry untagged Japanese
+captions; those are used as they are and nothing is fetched.
+
+Otherwise the episode's subtitle comes from Jimaku and is shown at once. A
+Jimaku subtitle is often made for another release, a few seconds off or with
+an ad break yours does not have, so it is then **timed to your video** in the
+background, by when lines start and never by what they say (the idea of
+[Tsubasa-sync](https://github.com/SonicSandbox/Tsubasa-sync)):
+
+1. Against another subtitle track of the file, in any language: an English
+   track times a Japanese subtitle. Seconds.
+2. Otherwise against the speech: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+   listens to the episode once, about a minute on a GPU, several on a CPU.
+   Install it with `install-whisper.ps1`; it uses the large-v3 model and CUDA
+   libraries [Anki Miner](https://github.com/0xzerolight/anki_miner) keeps if
+   they are there, otherwise downloads large-v3-turbo on first use.
+
+Each reference line votes for the offsets it agrees with; a walk through the
+lines picks one offset per stretch, so a broadcast cut becomes two offsets.
+A stretch must agree clearly better than chance, or nothing changes and mpv
+says why. The timed copy replaces the untimed one, keeps its selection, and is
+kept per video file, so it is done once. Measured on a real episode with the
+subtitle moved 3.7 s, and with an added 20 s cut: every line within 0.1 s, by
+a subtitle track and by Whisper alike; another episode's subtitle is refused.
+
+A file with neither another subtitle track nor Whisper keeps Jimaku's timing.
+
 ### AniList progress
 
 The plugin counts the parts of the file that played by themselves, over all
@@ -140,9 +171,10 @@ What counts:
   not seeking.
 - A line counts once half of it has played, or a full second of a long one.
   A pause, `sub-seek` or a skip over a line does not.
-- A line is its start time and text. Within a day it counts once per file,
-  however often you replay it, loop it or reopen the file; `sub-delay` does not
-  make it new. Another day counts it again.
+- A line is its text at a time. Within a day it counts once per file,
+  however often you replay it, loop it or reopen the file; `sub-delay` or a
+  Jimaku subtitle being retimed while it plays does not make it new (the same
+  text within 30 s is the same line). Another day counts it again.
 - Only lines with Japanese count (*Count Japanese lines only*), so English
   subtitles add time but no lines.
 
@@ -150,7 +182,10 @@ What counts:
 
 `%APPDATA%\immersion-mpv` / `~/.config/immersion-mpv`: `stats.jsonl`,
 `choices.json` (remembered series), `coverage.json` (how much of each file has
-played), `seen-<date>.tsv` (today's lines), `secrets.json`, `subs/` (Jimaku).
+played), `seen-<date>.tsv` (today's lines), `secrets.json`, `subs/` (Jimaku:
+`ep003.srt` as downloaded, `ep003-<video>.srt` timed to one video,
+`ep003-<video>.refused` saying why timing was not possible).
+Whisper's environment is in `%LOCALAPPDATA%\immersion-mpv\whisper`.
 
 ## Beside hachidori-mpv
 
@@ -169,7 +204,7 @@ is set to start by itself and has not started yet in this mpv.
 node --test scripts/immersion-mpv/settings/test/
 mpv --no-config --idle=yes --no-video --script=test/unit.lua --script-opts=immersion-test-dir=$PWD/scripts/immersion-mpv
 node test/run.mjs --mpv mpv --ffmpeg ffmpeg          # real mpv, local stand-ins for AniList and Jimaku
-node test/run.mjs --both --mpv mpv --ffmpeg ffmpeg   # also beside your hachidori-mpv
+node test/run.mjs --both --mpv mpv --ffmpeg ffmpeg   # also the installed copy beside your hachidori-mpv
 node --experimental-websocket test/settings-window.mjs path/to/electron out.png
 ```
 

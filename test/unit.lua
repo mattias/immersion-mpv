@@ -208,5 +208,74 @@ same(jimaku.has_japanese_track({{type = "audio", lang = "jpn"}}), false, "Japane
 same(jimaku.has_japanese_track({{type = "sub", title = "日本語"}}), true, "title")
 same(jimaku.has_japanese_track({{type = "sub", ["external-filename"] = "D:/x/Show.ja.srt"}}), true, "external")
 
+-- Timing, on made-up lines: irregular gaps, as speech has.
+local sync = require "sync"
+local function srt(starts, shift_at, before, after)
+    local parts = {}
+    for index, start in ipairs(starts) do
+        local moved = start + ((shift_at and start >= shift_at) and after or before)
+        table.insert(parts, ("%d\n%s --> %s\n行%d\n"):format(index,
+            ("%02d:%02d:%02d,%03d"):format(0, math.floor(moved / 60), math.floor(moved % 60), math.floor(moved * 1000 + 0.5) % 1000),
+            ("%02d:%02d:%02d,%03d"):format(0, math.floor((moved + 1.5) / 60), math.floor((moved + 1.5) % 60), math.floor((moved + 1.5) * 1000 + 0.5) % 1000),
+            index))
+    end
+    return table.concat(parts, "\n")
+end
+local times, random_times = {}, {}
+local at = 5
+local seed = 7
+local function next_random()
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed / 2147483648
+end
+for _ = 1, 120 do
+    at = at + 1.5 + next_random() * 6
+    table.insert(times, at)
+end
+at = 5
+for _ = 1, 120 do
+    at = at + 1.5 + next_random() * 6
+    table.insert(random_times, at)
+end
+local truth = sync.starts(srt(times, nil, 0))
+
+local shifted = srt(times, nil, 3.7)
+local result = sync.align(sync.starts(shifted), truth)
+same(result and #result.segments, 1, "one offset")
+same(result and string.format("%.2f", result.segments[1].offset), "-3.70", "the offset")
+same(sync.starts(sync.retime(shifted, result.segments))[10], truth[10], "retimed onto the reference")
+
+local cut_at = times[60] + 0.5
+local cut = srt(times, cut_at, 1.0, 21.0)
+result = sync.align(sync.starts(cut), truth)
+same(result and #result.segments, 2, "a broadcast cut is two offsets")
+local retimed = sync.starts(sync.retime(cut, result and result.segments or {}))
+local exact = 0
+for index = 1, #truth do
+    if retimed[index] and math.abs(retimed[index] - truth[index]) < 0.01 then exact = exact + 1 end
+end
+same(exact, #truth, "every line lands after a cut")
+
+local result_random, reason = sync.align(sync.starts(srt(random_times, nil, 0)), truth)
+same(result_random, nil, "an unrelated subtitle is refused")
+same(type(reason), "string", "with a reason")
+same(sync.align({1, 2, 3}, truth), nil, "too few lines are refused")
+
+local ass = "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    .. "Dialogue: 0,0:00:10.00,0:00:12.50,Default,,0,0,0,,こんにちは\nComment: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,x\n"
+same(sync.retime(ass, {{from = 0, offset = 2.25}}):match("Dialogue: 0,([^,]+,[^,]+)"), "0:00:12.25,0:00:14.75", "ASS is retimed")
+same(#sync.starts(ass), 1, "ASS comments are no lines")
+
+do
+    local tracker = stats.new({}, nil, true)
+    local run = player(tracker)
+    run.play(2, {text = "同じ", start = 0, stop = 2})
+    run.play(2, {text = "同じ", start = 3.7, stop = 5.7})
+    same(tracker.lines, 1, "a line moved by retiming counts once")
+    run.seek(100)
+    run.play(2, {text = "同じ", start = 100, stop = 102})
+    same(tracker.lines, 2, "the same words much later are a new line")
+end
+
 print(("%d checks, %d failed"):format(checks, failures))
 mp.commandv("quit", failures == 0 and 0 or 1)

@@ -62,6 +62,39 @@ function M.line_key(text, start, delay)
     return string.format("%.1f|%s", start - (delay or 0), text:gsub("[\r\n]+", " "))
 end
 
+-- The same text this close in time is the same line: a subtitle retimed while
+-- it plays (Jimaku timing) moves its lines by a few seconds.
+local SAME_LINE = 30
+
+function Tracker:seen_near(key)
+    local start, text = key:match("^([%d.%-]+)|(.*)$")
+    start = tonumber(start)
+    if not start then return self.seen[key] == true end
+    if not self.by_text then
+        self.by_text = {}
+        for seen_key in pairs(self.seen) do
+            local seen_start, seen_text = seen_key:match("^([%d.%-]+)|(.*)$")
+            if seen_text then
+                self.by_text[seen_text] = self.by_text[seen_text] or {}
+                table.insert(self.by_text[seen_text], tonumber(seen_start))
+            end
+        end
+    end
+    for _, other in ipairs(self.by_text[text] or {}) do
+        if math.abs(other - start) <= SAME_LINE then return true end
+    end
+    return false
+end
+
+function Tracker:mark_seen(key)
+    self.seen[key] = true
+    local start, text = key:match("^([%d.%-]+)|(.*)$")
+    if self.by_text and text then
+        self.by_text[text] = self.by_text[text] or {}
+        table.insert(self.by_text[text], tonumber(start))
+    end
+end
+
 function Tracker:hear(snapshot, moved)
     local text, start, stop = snapshot.text, snapshot.start, snapshot.stop
     if not text or text == "" or not start or not stop or stop <= start then
@@ -74,9 +107,9 @@ function Tracker:hear(snapshot, moved)
         self.heard = 0
     end
     self.heard = self.heard + moved
-    if self.seen[key] or self.heard < math.min(MIN_HEARD, (stop - start) * 0.5) then return end
+    if self.heard < math.min(MIN_HEARD, (stop - start) * 0.5) or self:seen_near(key) then return end
     if self.japanese_only and not parse.is_japanese(text) then return end
-    self.seen[key] = true
+    self:mark_seen(key)
     self.lines = self.lines + 1
     self.chars = self.chars + parse.count_chars(text)
     if self.on_line then self.on_line(key) end
@@ -116,6 +149,7 @@ end
 -- A new day counts its lines anew; the file's coverage goes on.
 function Tracker:new_day()
     self.seen = {}
+    self.by_text = nil
     self.line = nil
 end
 

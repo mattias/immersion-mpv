@@ -23,16 +23,21 @@ local function has_japanese_mark(text)
     return lower:find("japanese", 1, true) ~= nil or text:find("日本語", 1, true) ~= nil
 end
 
+-- Whether a track says it is Japanese: by its language, title or file name.
+-- (Tracks that say nothing are read: see reference.survey.)
+function M.is_japanese_track(track)
+    if track.type ~= "sub" then return false end
+    local lang = (track.lang or ""):lower()
+    if lang == "ja" or lang == "jp" or lang == "jpn" or lang:find("^ja%-") then return true end
+    if track.title and has_japanese_mark(track.title) then return true end
+    local name = track["external-filename"]
+    return name ~= nil and (has_japanese_mark(name) or name:lower():find("[.%-_]jpn?[.%-_]") ~= nil
+        or name:lower():find("[.%-_]ja[.%-_]") ~= nil)
+end
+
 function M.has_japanese_track(tracks)
     for _, track in ipairs(tracks) do
-        if track.type == "sub" then
-            local lang = (track.lang or ""):lower()
-            if lang == "ja" or lang == "jp" or lang == "jpn" or lang:find("^ja%-") then return true end
-            if track.title and has_japanese_mark(track.title) then return true end
-            local name = track["external-filename"]
-            if name and (has_japanese_mark(name) or name:lower():find("[.%-_]jpn?[.%-_]")
-                or name:lower():find("[.%-_]ja[.%-_]")) then return true end
-        end
+        if M.is_japanese_track(track) then return true end
     end
     return false
 end
@@ -71,6 +76,39 @@ function M.cached(media_id, episode)
         if info and info.is_file and info.size > 0 then return stem .. "." .. kind end
     end
     return nil
+end
+
+-- A subtitle timed to one video fits that video only, so the timed copy is
+-- kept per video: its file name, hashed into the cache's own ASCII names.
+local function hash(text)
+    local value = 5381
+    for index = 1, #text do value = (value * 33 + text:byte(index)) % 4294967296 end
+    return string.format("%08x", value)
+end
+
+function M.place(media_id, episode, video_name)
+    return cache_stem(media_id, episode) .. "-" .. hash(video_name)
+end
+
+function M.timed(place)
+    for kind in pairs(EXTENSIONS) do
+        local info = utils.file_info(place .. "." .. kind)
+        if info and info.is_file and info.size > 0 then return place .. "." .. kind end
+    end
+    return nil
+end
+
+function M.timed_path(place, raw)
+    return place .. "." .. extension(raw)
+end
+
+function M.refused(place)
+    return utils.file_info(place .. ".refused") ~= nil
+end
+
+-- Timing is not tried again for a video it failed on; the reason is kept.
+function M.mark_refused(place, reason)
+    store.write(place .. ".refused", tostring(reason) .. "\n")
 end
 
 local function download(file, media_id, episode, done)

@@ -68,12 +68,19 @@ const server = http.createServer((request, response) => {
     }
     if (url.pathname.startsWith("/api/") && request.headers.authorization !== FAKE_KEY) return json({ error: "no" }, 401);
     if (url.pathname === "/api/entries/search") return json([{ id: 77, name: "Testshow Alpha", flags: {} }]);
-    if (url.pathname === "/api/entries/77/files") {
+    if (url.pathname === "/api/entries/77/files" && url.searchParams.get("episode") === "3") {
       const base = `http://127.0.0.1:${server.address().port}/dl`;
       return json([
         { name: "[Z] Testshow Alpha - 04.srt", url: `${base}/wrong.srt`, size: 10, last_modified: "2026-01-01T00:00:00Z" },
         { name: "[Z] Testshow Alpha - 03.srt", url: `${base}/right.srt`, size: 10, last_modified: "2025-01-01T00:00:00Z" },
       ]);
+    }
+    if (url.pathname === "/api/entries/77/files" && url.searchParams.get("episode") === "8") {
+      return json([{ name: "[Z] Testshow Alpha - 08.srt", url: `http://127.0.0.1:${server.address().port}/dl/eight.srt`, size: 10, last_modified: "2025-01-01T00:00:00Z" }]);
+    }
+    if (url.pathname === "/dl/eight.srt") {
+      response.writeHead(200);
+      return response.end(subtitleAt(2.5, n => `日本語の行${n + 1}です`));
     }
     if (url.pathname === "/dl/right.srt") {
       response.writeHead(200);
@@ -87,27 +94,41 @@ await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
 const stub = `http://127.0.0.1:${server.address().port}`;
 
 // The videos.
-function video(name, seconds, subtitle) {
+// embedded: {text, lang} puts a subtitle track inside the file.
+function video(name, seconds, subtitle, embedded) {
   const file = path.join(work, name);
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  const inside = [];
+  if (embedded) {
+    fs.writeFileSync(`${file}.inside.srt`, embedded.text);
+    inside.push("-i", `${file}.inside.srt`);
+  }
   execFileSync(ffmpeg, ["-v", "error", "-y", "-f", "lavfi", "-i", `testsrc2=s=320x180:r=10:d=${seconds}`,
-    "-f", "lavfi", "-i", `sine=d=${seconds}`, "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", file]);
+    "-f", "lavfi", "-i", `sine=d=${seconds}`, ...inside, "-map", "0", "-map", "1", ...(embedded ? ["-map", "2", "-c:s", "srt",
+      "-metadata:s:s:0", `language=${embedded.lang}`] : []),
+    "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", file]);
+  if (embedded) fs.rmSync(`${file}.inside.srt`);
   if (subtitle) fs.writeFileSync(`${file.replace(/\.mkv$/, "")}.ja.srt`, subtitle);
   return file;
 }
 const stamp = seconds => {
-  const whole = Math.floor(seconds);
-  return `00:00:${String(whole).padStart(2, "0")},${String(Math.round((seconds - whole) * 1000)).padStart(3, "0")}`;
+  const millis = Math.round(seconds * 1000);
+  const two = value => String(value).padStart(2, "0");
+  return `00:${two(Math.floor(millis / 60000))}:${two(Math.floor(millis / 1000) % 60)},${String(millis % 1000).padStart(3, "0")}`;
 };
+// Lines at irregular times, as speech has, for timing tests.
+const spoken = [];
+for (let n = 0, at = 2; n < 40; n += 1) { spoken.push(at); at += 1.5 + ((n * 37) % 11) / 2.5; }
+const subtitleAt = (shift, text) => spoken.map((at, n) => `${n + 1}\n${stamp(at + shift)} --> ${stamp(at + shift + 1.2)}\n${text(n)}\n`).join("\n");
 let lines = "";
 for (let n = 1; n <= 15; n += 1) lines += `${n}\n${stamp((n - 1) * 2)} --> ${stamp(n * 2 - 0.2)}\n行${n}です\n\n`;
 
 function run(file, mode, { data, extra = [], config = false } = {}) {
   const args = [
-    ...(config ? [] : ["--no-config"]),
+    ...(config ? ["--save-position-on-quit=no", "--resume-playback=no"] : ["--no-config"]),
     "--ao=null", "--geometry=320x180", "--force-window=yes", "--keep-open=yes", "--pause=no", "--msg-level=all=v",
-    `--script=${scriptDir}`, `--script=${path.join(here, "e2e-driver.lua")}`, "--sub-auto=fuzzy",
-    `--script-opts=e2e-mode=${mode},immersion-mpv-anilist_url=${stub}/graphql,immersion-mpv-jimaku_url=${stub}`,
+    ...(config ? [] : [`--script=${scriptDir}`]), `--script=${path.join(here, "e2e-driver.lua")}`, "--sub-auto=fuzzy",
+    `--script-opts=e2e-mode=${mode},immersion-mpv-anilist_url=${stub}/graphql,immersion-mpv-jimaku_url=${stub},immersion-mpv-sync_whisper=no`,
     ...extra, file];
   return new Promise(resolve => {
     const child = spawn(mpv, args, { env: { ...process.env, IMMERSION_MPV_DATA: data } });
@@ -208,6 +229,22 @@ try {
   check(searches() === before, "the folder is not asked about again");
   check(mutations().length === 2 && mutations()[1].variables.mediaId === 2001 && mutations()[1].variables.progress === 6, "the remembered series moves forward", JSON.stringify(mutations()));
 
+  console.log("-- timing and untagged tracks");
+  const timing = dataDir("timing", true);
+  const eight = video("Series/[Z] Testshow Alpha - 08 (1080p).mkv", 130, null, { text: subtitleAt(0, n => `English line ${n + 1}`), lang: "eng" });
+  result = await run(eight, "both", { data: timing, extra: ["--script-opts-append=e2e-wait=8"] });
+  check((result.seen["sub-track"] ?? []).includes("Jimaku (timed)|ja|true"), "Jimaku's subtitle is timed by the English track and selected", JSON.stringify(result.seen));
+  check(!(result.seen["sub-track"] ?? []).some(entry => entry.startsWith("Jimaku|")), "the untimed one is gone");
+  const timedFile = fs.readdirSync(path.join(timing, "subs", "1001")).find(name => /^ep008-[0-9a-f]{8}\.srt$/.test(name));
+  check(timedFile && fs.readFileSync(path.join(timing, "subs", "1001", timedFile), "utf8").includes(`${stamp(spoken[0])} -->`), "its lines now start with the video's", timedFile);
+  const downloads8 = requests.filter(entry => entry.path === "/dl/eight.srt").length;
+  result = await run(eight, "both", { data: timing, extra: ["--script-opts-append=e2e-wait=3"] });
+  check((result.seen["sub-track"] ?? []).includes("Jimaku (timed)|ja|true") && requests.filter(entry => entry.path === "/dl/eight.srt").length === downloads8, "next time the timed copy comes at once", JSON.stringify(result.seen));
+
+  const nine = video("Series/[Z] Testshow Alpha - 09 (1080p).mkv", 20, null, { text: subtitleAt(0, n => `字幕の行${n + 1}`), lang: "und" });
+  result = await run(nine, "both", { data: timing, extra: ["--script-opts-append=e2e-wait=5"] });
+  check(!requests.some(entry => entry.query === "?episode=9"), "an untagged Japanese track is recognised: no Jimaku", JSON.stringify(result.seen));
+
   console.log("-- two sittings");
   const split = dataDir("split", true);
   const seven = video("Series/[Z] Testshow Alpha - 07 (1080p).mkv", 10);
@@ -232,7 +269,14 @@ try {
   check(!everything.includes(FAKE_TOKEN) && !everything.includes(FAKE_KEY), "keys appear in no log, even verbose");
 
   if (process.argv.includes("--both")) {
+    // This runs mpv's own config, so it tests the installed copy: install first.
     console.log("-- beside hachidori-mpv");
+    const installed = path.join(process.env.APPDATA ?? path.join(os.homedir(), ".config"), "mpv", "scripts", "immersion-mpv");
+    for (const name of fs.readdirSync(scriptDir).filter(file => file.endsWith(".lua"))) {
+      const copy = path.join(installed, name);
+      check(fs.existsSync(copy) && fs.readFileSync(copy, "utf8") === fs.readFileSync(path.join(scriptDir, name), "utf8"),
+        `the installed ${name} is this one (run the installer)`);
+    }
     const both = dataDir("both");
     result = await run(statsFile, "both", { data: both, config: true, extra: ["--script-opts-append=e2e-wait=14"] });
     list = rows(both);
@@ -246,8 +290,8 @@ try {
     check(bindings.some(entry => entry.startsWith("hachidori_mpv:")) && keys.length > 3, "hachidori-mpv kept its own", bindings.join());
 
     const beside = dataDir("beside", true);
-    result = await run(three, "both", { data: beside, config: true, extra: ["--script-opts-append=e2e-wait=8"] });
-    check(result.seen["sub-track"]?.[0] === "Jimaku|ja|true", "Jimaku's subtitle arrives", JSON.stringify(result.seen));
+    result = await run(three, "both", { data: beside, config: true, extra: ["--script-opts-append=e2e-wait=14"] });
+    check(result.seen["sub-track"]?.[0] === "Jimaku|ja|true", "Jimaku's subtitle arrives", result.log.split("\n").filter(line => /immersion_mpv|hachidori/.test(line) && !/Setting option|Command line/.test(line)).slice(-25).join("\n"));
     check(result.seen["input-ipc-server"]?.[0]?.includes("hachidori-mpv"), "hachidori-mpv is started for it", JSON.stringify(result.seen));
     check(result.seen["sub-visibility"]?.[0] === "no", "and draws it");
   }

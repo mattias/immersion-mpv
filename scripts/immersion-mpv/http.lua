@@ -43,7 +43,8 @@ function M.request(request, done)
     if request.follow then table.insert(config, "location") end
     if request.max_size then table.insert(config, "max-filesize = " .. tostring(request.max_size)) end
     sequence = sequence + 1
-    local config_file = store.path(("curl-%s-%d.conf"):format(mp.get_property("pid", "0"), sequence))
+    local config_file = store.path(("curl-%s-%s-%d.conf"):format(mp.get_property("pid", "0"),
+        mp.get_script_name(), sequence))
     if not store.write(config_file, table.concat(config, "\n") .. "\n") then
         done(nil, "cannot write to the data folder")
         return

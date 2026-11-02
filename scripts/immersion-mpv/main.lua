@@ -14,8 +14,10 @@ local anilist = require "anilist"
 local http = require "http"
 local jimaku = require "jimaku"
 local parse = require "parse"
+local reference = require "reference"
 local stats = require "stats"
 local store = require "store"
+local sync = require "sync"
 
 local opts = {
     -- Count listening time, subtitle lines and characters.
@@ -24,6 +26,16 @@ local opts = {
     stats_japanese_only = true,
     -- Fetch a Japanese subtitle from Jimaku when the file has none.
     jimaku_enabled = true,
+    -- Time a Jimaku subtitle to the video: by another subtitle track of the
+    -- file, or else by the speech (Whisper, when installed).
+    sync_enabled = true,
+    sync_whisper = true,
+    -- Empty means: install-whisper.ps1's Python; Anki Miner's large-v3, or
+    -- large-v3-turbo (downloaded on first use).
+    whisper_python = "",
+    whisper_model = "",
+    -- Empty means: the ffmpeg next to mpv, then ffmpeg on PATH.
+    ffmpeg_path = "",
     -- Mark watched episodes on AniList.
     anilist_enabled = true,
     -- How much of an episode must have played, in percent.
@@ -184,36 +196,124 @@ local function wake_hachidori()
     mp.commandv("script-binding", "hachidori_mpv/toggle")
 end
 
-local function add_subtitle(path)
-    mp.commandv("sub-add", path, "select", "Jimaku", "ja")
+local function add_subtitle(path, title)
+    mp.commandv("sub-add", path, "select", title, "ja")
     wake_hachidori()
 end
 
+-- mpv may write a path with other slashes than it was given.
+local function same_path(a, b)
+    local function plain(path)
+        path = path:gsub("\\", "/")
+        return is_windows and path:lower() or path
+    end
+    return a ~= nil and b ~= nil and plain(a) == plain(b)
+end
+
+local function track_of(path)
+    for _, track in ipairs(mp.get_property_native("track-list", {})) do
+        if track.type == "sub" and same_path(track["external-filename"], path) then return track end
+    end
+    return nil
+end
+
+-- The timed subtitle takes the untimed one's place, and its selection.
+local function replace_subtitle(old_path, new_path)
+    local old = track_of(old_path)
+    if old then mp.commandv("sub-remove", tostring(old.id)) end
+    mp.commandv("sub-add", new_path, (not old or old.selected) and "select" or "auto", "Jimaku (timed)", "ja")
+end
+
+-- Whisper's starts are rougher than a subtitle's, so they may be further off.
+local TOLERANCE = {track = 0.4, whisper = 0.6}
+-- Less than this is not worth a change.
+local DEADBAND = 0.15
+
+local function time_subtitle(this_file, raw, reference_track, place)
+    local text = store.read(raw)
+    if not text then return end
+    local function settle(reference_text, kind, reason)
+        if not reference_text then
+            msg.info("not timed: " .. tostring(reason))
+            jimaku.mark_refused(place, reason)
+            if this_file == current then osd("Jimaku subtitle kept as it is: " .. tostring(reason), 5) end
+            return
+        end
+        local result, why = sync.align(sync.starts(text), sync.starts(reference_text), {tolerance = TOLERANCE[kind]})
+        if not result then
+            settle(nil, kind, why)
+            return
+        end
+        local first = result.segments[1].offset
+        local unchanged = #result.segments == 1 and math.abs(first) < DEADBAND
+        local timed = jimaku.timed_path(place, raw)
+        store.write(timed, unchanged and text or sync.retime(text, result.segments))
+        local summary = (unchanged and "already in time" or sync.describe(result))
+            .. (kind == "whisper" and " (by the speech)" or " (by the video's subtitles)")
+        msg.info("timed: " .. summary)
+        if this_file ~= current then return end
+        replace_subtitle(raw, timed)
+        osd("Jimaku subtitle timed: " .. summary, 5)
+    end
+    local function by_speech(reason)
+        if not opts.sync_whisper then
+            settle(nil, "whisper", reason or "the video has no subtitle to time against")
+            return
+        end
+        if this_file == current then osd("timing the Jimaku subtitle by the speech (about a minute)", 3) end
+        reference.whisper(opts, this_file.media, script_dir, function(reference_text, err)
+            settle(reference_text, "whisper", err)
+        end)
+    end
+    if reference_track then
+        reference.extract(opts, this_file.media, reference_track, function(reference_text, err)
+            if reference_text then settle(reference_text, "track") else by_speech(err) end
+        end)
+    else
+        by_speech()
+    end
+end
+
 local function fetch_subtitle()
-    if not current or current.subtitle_done or not current.identity then return end
+    if not current or current.subtitle_started or not current.identity then return end
     if not opts.jimaku_enabled then return end
-    if jimaku.has_japanese_track(mp.get_property_native("track-list", {})) then return end
     local identity, info = current.identity, current.info
     local movie = identity.format == "MOVIE"
     if not movie and not info.episode then return end
     local episode = (not movie) and info.episode or nil
-    local cached = jimaku.cached(identity.id, episode)
-    current.subtitle_done = true
-    if cached then
-        add_subtitle(cached)
-        return
-    end
-    if not secrets.jimaku_key then return end
+    current.subtitle_started = true
     local this_file = current
-    jimaku.fetch(opts.jimaku_url, secrets.jimaku_key, identity.id, episode, info.group, function(path, reason)
-        if this_file ~= current then return end
-        if path then
-            add_subtitle(path)
-            osd("Japanese subtitle from Jimaku", 3)
-        else
-            msg.info("Jimaku: " .. tostring(reason))
-            osd(reason, 4)
+    local tracks = mp.get_property_native("track-list", {})
+    reference.survey(opts, current.media, tracks, jimaku.is_japanese_track, function(japanese, reference_track)
+        if this_file ~= current or japanese then return end
+        local place = jimaku.place(identity.id, episode, this_file.file_id)
+        local timed = jimaku.timed(place)
+        if timed then
+            add_subtitle(timed, "Jimaku (timed)")
+            return
         end
+        local function have(raw)
+            add_subtitle(raw, "Jimaku")
+            if opts.sync_enabled and not jimaku.refused(place) and this_file.is_local then
+                time_subtitle(this_file, raw, reference_track, place)
+            end
+        end
+        local cached = jimaku.cached(identity.id, episode)
+        if cached then
+            have(cached)
+            return
+        end
+        if not secrets.jimaku_key then return end
+        jimaku.fetch(opts.jimaku_url, secrets.jimaku_key, identity.id, episode, info.group, function(path, reason)
+            if this_file ~= current then return end
+            if path then
+                osd("Japanese subtitle from Jimaku", 3)
+                have(path)
+            else
+                msg.info("Jimaku: " .. tostring(reason))
+                osd(reason, 4)
+            end
+        end)
     end)
 end
 
@@ -489,6 +589,7 @@ mp.register_event("file-loaded", function()
     current = {
         file_id = filename,
         is_local = is_local,
+        media = is_local and utils.join_path(mp.get_property("working-directory", ""), path) or path,
         info = info,
         folder = is_local and (utils.split_path(utils.join_path(mp.get_property("working-directory", ""), path))) or "",
         title_key = parse.norm(info.names[1] or ""),
