@@ -3,7 +3,7 @@
 An mpv plugin for watching Japanese: it records what you really listened to,
 fetches a Japanese subtitle from [Jimaku](https://jimaku.cc) when a file has
 none, and marks watched episodes on [AniList](https://anilist.co). It runs on
-its own or beside [hachidori-mpv](../hachidori-mpv), and each part can be
+its own or beside [hachidori-mpv](https://github.com/mattias/hachidori-mpv), and each part can be
 turned off.
 
 - **Statistics**: per file and day, the time really played, unique subtitle
@@ -19,6 +19,12 @@ turned off.
 - **curl**, which Windows 10 and 11 include
 - For the Settings window: hachidori-mpv's Electron, or **Node.js 18+** to
   install one (not to run)
+- Optional: **ffmpeg** (beside mpv or on `PATH`) to read untagged subtitle
+  tracks and to time Jimaku subtitles, and [uv](https://docs.astral.sh/uv/)
+  to install Whisper
+
+Developed and tested on Windows 11. The Linux paths are written but not yet
+tested; reports are welcome.
 
 ## Install
 
@@ -104,7 +110,8 @@ background, by when lines start and never by what they say (the idea of
    track times a Japanese subtitle. Seconds.
 2. Otherwise against the speech: [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
    listens to the episode once, about a minute on a GPU, several on a CPU.
-   Install it with `install-whisper.ps1`; it uses the large-v3 model and CUDA
+   Install it with `install-whisper.ps1` (Windows) or `install-whisper.sh`
+   (Linux); on Windows it uses the large-v3 model and CUDA
    libraries [Anki Miner](https://github.com/0xzerolight/anki_miner) keeps if
    they are there, otherwise downloads large-v3-turbo on first use.
 
@@ -238,7 +245,8 @@ the plugin leaves it alone for as long as it asks (`Retry-After` or
 played), `seen-<date>.tsv` (today's lines), `secrets.json`, `subs/` (Jimaku:
 `ep003.srt` as downloaded, `ep003-<video>.srt` timed to one video,
 `ep003-<video>.refused` saying why timing was not possible).
-Whisper's environment is in `%LOCALAPPDATA%\immersion-mpv\whisper`.
+Whisper's environment is in `%LOCALAPPDATA%\immersion-mpv\whisper` /
+`~/.local/share/immersion-mpv/whisper`.
 
 ## Beside hachidori-mpv
 
