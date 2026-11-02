@@ -129,6 +129,27 @@ At the threshold it reads your list and:
 - adds the series as *Watching* if it is not on your list, sets *Completed* on
   the last episode, and moves *Planning*, *Paused* or *Dropped* to *Watching*.
 
+### Continue where you left off
+
+mpv itself can remember where you stopped a file and start there the next
+time you open it. This plugin does not do it for you; add these lines to
+mpv's own `mpv.conf` (`%APPDATA%\mpv\mpv.conf` on Windows,
+`~/.config/mpv/mpv.conf` on Linux, or `portable_config\mpv.conf` beside a
+portable mpv):
+
+```ini
+# Remember where a file was left and continue there when it is opened again.
+save-position-on-quit=yes
+# Only save the position and the sound, not subtitle visibility, the A-B loop
+# or the subtitle track: hachidori-mpv and immersion-mpv set those themselves.
+watch-later-options=start,speed,volume,mute,aid,audio-delay,sub-delay
+```
+
+Close mpv with `q` (or the window's close button) and the position is saved;
+`Q` also saves it explicitly. Restart mpv for the change to take effect. The
+saved positions are in `watch_later` beside `mpv.conf`; delete that folder to forget
+them all.
+
 ## Statistics
 
 Rows are appended to `stats.jsonl` in the data folder every 30 seconds and when
